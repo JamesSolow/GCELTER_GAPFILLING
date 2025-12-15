@@ -1,20 +1,20 @@
 %% =========================================
 %% Physics-Aware Imputation Pipeline
-%% (NaN-safe KNN-style Salinity Imputation)
+%% (Strict Global Quadratic Salinity Imputation)
 %% =========================================
+%% Strict quadratic fit was best for Conductance vs Salinity, but need to figure out how to get rid of jump that occurrs when the gap starts.
 clearvars -except Conductance Temp_Water Salinity Oxygen_Conc Oxygen_Sat ...
                      pH Turbidity Depth_Corrected Date Month Flag_* 
 
-fprintf('\n=== Physics-Aware Imputation Pipeline (NaN-Safe KNN Salinity) ===\n')
+fprintf('\n=== Physics-Aware Imputation Pipeline (Strict Quadratic) ===\n')
 
 %% ---- Parameters ----
 MaxGap_short = 12;  % short gap for linear interpolation (samples)
 MaxGap_long  = 48;  % long gap limit
 MaxTurbGap   = 5;   % safe turbidity fill (samples)
-k_neighbors  = 3;   % K for KNN-style imputation
 
 %% =====================================================
-%% 1. Temperature (primary driver)
+%% 1. Temperature
 %% =====================================================
 Temp_imp = fillmissing(Temp_Water,'linear','MaxGap',MaxGap_long);
 
@@ -24,48 +24,37 @@ Temp_imp = fillmissing(Temp_Water,'linear','MaxGap',MaxGap_long);
 Cond_imp = fillmissing(Conductance,'linear','MaxGap',MaxGap_long);
 
 %% =====================================================
-%% 3. Salinity – KNN-style local imputation
+%% 3. Salinity – Strict Global Quadratic
 %% =====================================================
-Sal_imp = Salinity;  
+Sal_imp = Salinity;
 
-% Convert measured/missing indices to actual indices
-idx_meas    = find(~isnan(Sal_imp) & ~isnan(Cond_imp));
-idx_missing = find(isnan(Sal_imp) & ~isnan(Cond_imp));
+idx_meas = ~isnan(Sal_imp) & ~isnan(Cond_imp);
+idx_missing = isnan(Sal_imp) & ~isnan(Cond_imp);
 
-for i = idx_missing'
-    % distances in Conductance to measured points
-    distances = abs(Cond_imp(idx_meas) - Cond_imp(i));
-    
-    % select k nearest neighbors
-    k = min(k_neighbors, numel(idx_meas));
-    [~, idx_sorted] = sort(distances);
-    nearest = idx_sorted(1:k);
-    
-    % inverse distance weighting
-    weights = 1 ./ distances(nearest);
-    weights = weights / sum(weights);
-    
-    % compute weighted average using actual indices
-    Sal_imp(i) = sum(weights .* Sal_imp(idx_meas(nearest)));
+if sum(idx_meas) < 3
+    error('Not enough measured points to fit quadratic.');
 end
 
-% ensure measured points remain exact
-Sal_imp(idx_meas) = Salinity(idx_meas);
+% Fit global quadratic to measured points
+p_global = polyfit(Cond_imp(idx_meas), Sal_imp(idx_meas), 2);
 
-fprintf('Salinity imputation (KNN-style) completed. Imputed %d points.\n', numel(idx_missing));
+% Impute missing points strictly along the quadratic
+Sal_imp(idx_missing) = polyval(p_global, Cond_imp(idx_missing));
+
+fprintf('Salinity imputation (strict quadratic) completed. Imputed %d points.\n', sum(idx_missing));
 
 %% =====================================================
-%% 4. Oxygen_Conc – physics-aware regression on Temperature
+%% 4. Oxygen_Conc – regression on Temperature
 %% =====================================================
 O2_imp = Oxygen_Conc;
 idx_fit = ~isnan(Oxygen_Conc) & ~isnan(Temp_imp);
 mdl_OT  = fitlm(Temp_imp(idx_fit), Oxygen_Conc(idx_fit));
 idx_fill = isnan(O2_imp) & ~isnan(Temp_imp);
 O2_imp(idx_fill) = predict(mdl_OT, Temp_imp(idx_fill));
-fprintf('Oxygen filled (physics-aware): %d points\n', sum(idx_fill))
+fprintf('Oxygen filled: %d points\n', sum(idx_fill))
 
 %% =====================================================
-%% 5. Oxygen_Sat – derived from Oxygen_Conc
+%% 5. Oxygen_Sat – interpolation
 %% =====================================================
 O2sat_imp = Oxygen_Sat;
 idx_fill = isnan(O2sat_imp) & ~isnan(O2_imp);
@@ -74,7 +63,7 @@ O2sat_imp(idx_fill) = interp1(find(~isnan(Oxygen_Conc)), ...
                                find(idx_fill),'linear','extrap');
 
 %% =====================================================
-%% 6. pH – weakly physics-aware
+%% 6. pH – regression on Oxygen
 %% =====================================================
 pH_imp = pH;
 idx_fit = ~isnan(pH) & ~isnan(O2_imp);
@@ -116,7 +105,7 @@ else
 end
 
 %% =====================================================
-%% 9. Diagnostics – remaining NaNs
+%% 9. Diagnostics
 %% =====================================================
 fprintf('\nRemaining NaNs after imputation:\n')
 fprintf('Temp: %d\n', sum(isnan(Temp_imp)))
@@ -129,44 +118,12 @@ fprintf('Turb: %d\n', sum(isnan(Turb_imp)))
 fprintf('Depth_Corrected: %d\n', sum(isnan(Depth_corr_imp)))
 
 %% =====================================================
-%% 10. Physics-aware scatter plots
+%% 10. Scatter Plots
 %% =====================================================
-
-% --- Oxygen vs Temperature
-figure('Name','Oxygen vs Temperature: Physics-Aware Imputation')
-scatter(Temp_Water, Oxygen_Conc, 10, [0.7 0.7 0.7], 'filled'); hold on
-scatter(Temp_imp(isnan(Oxygen_Conc)), O2_imp(isnan(Oxygen_Conc)), 20, 'r', 'filled')
-xlabel('Temperature [°C]'); ylabel('Oxygen [mg/L]');
-title('Oxygen vs Temperature: Imputed points respect solubility physics')
-grid on
-legend('Original','Imputed','Location','best')
-
-% --- Salinity vs Conductance
-figure('Name','Salinity vs Conductance: Physics-Aware Imputation')
-scatter(Conductance, Salinity, 10, [0.7 0.7 0.7], 'filled'); hold on
-scatter(Conductance(isnan(Salinity)), Sal_imp(isnan(Salinity)), 20, 'b', 'filled')
+figure('Name','Salinity vs Conductance: Strict Quadratic')
+scatter(Cond_imp(idx_meas), Sal_imp(idx_meas), 10, [0.7 0.7 0.7], 'filled'); hold on
+scatter(Cond_imp(idx_missing), Sal_imp(idx_missing), 20, 'b', 'filled')
 xlabel('Conductance'); ylabel('Salinity [psu]');
-title('Salinity vs Conductance: KNN-style local imputation preserves curve')
+title('Salinity: Strict quadratic fit (no extrapolation adjustments)')
 grid on
-legend('Original','Imputed','Location','best')
-
-% --- Time series: Temp, Sal, O2
-figure('Name','Time Series: Physics-Aware Imputation')
-subplot(3,1,1)
-plot(Date, Temp_Water, '.', 'Color', [0.7 0.7 0.7]); hold on
-plot(Date(isnan(Temp_Water)), Temp_imp(isnan(Temp_Water)), 'go', 'MarkerFaceColor','g')
-ylabel('Temperature [°C]'); grid on
-title('Temperature: Imputed points (green) respect continuity')
-
-subplot(3,1,2)
-plot(Date, Salinity, '.', 'Color', [0.7 0.7 0.7]); hold on
-plot(Date(isnan(Salinity)), Sal_imp(isnan(Salinity)), 'bo', 'MarkerFaceColor','b')
-ylabel('Salinity [psu]'); grid on
-title('Salinity: Imputed points (blue) respect local curve')
-
-subplot(3,1,3)
-plot(Date, Oxygen_Conc, '.', 'Color', [0.7 0.7 0.7]); hold on
-plot(Date(isnan(Oxygen_Conc)), O2_imp(isnan(Oxygen_Conc)), 'ro', 'MarkerFaceColor','r')
-xlabel('Date'); ylabel('Oxygen [mg/L]'); grid on
-title('Oxygen: Imputed points (red) respect Temp–O2 physics')
-sgtitle('Physics-Aware Imputation: Original vs Imputed')
+legend('Measured','Imputed','Location','best')
